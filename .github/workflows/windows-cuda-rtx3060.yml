@@ -7,6 +7,8 @@ on:
     branches: [master]
     paths:
       - '.github/workflows/windows-cuda-rtx3060.yml'
+      - 'src/llama-moe-cache.cpp'
+      - 'src/llama-moe-cache.h'
 
 permissions:
   contents: read
@@ -114,6 +116,8 @@ jobs:
             "Keep all .exe and .dll files together in one folder.",
             "Requires up-to-date NVIDIA graphics drivers and Microsoft Visual C++ runtime.",
             "Models (.gguf) are not included.",
+            "Phase 2A: set the MOE_TRACE_PATH environment variable to an absolute writable JSONL file path.",
+            "Tracing requires -cmoe and --moe-cache-mib greater than zero.",
             "",
             "To check flags: .\llama-cli.exe --help",
             "To run Ling Tiny: .\llama-cli.exe -m D:\Models\Ling-3.0-tiny-Q8_0.gguf -ngl 99 -c 2048 -n 128",
