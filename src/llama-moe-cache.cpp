@@ -6,6 +6,10 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <sstream>
 #include <stdexcept>
 #include <unordered_map>
 #include <vector>
@@ -210,6 +214,11 @@ struct llama_moe_cache::impl {
     std::vector<int32_t> ids;
     std::vector<moe_cache_lru::fill> fills;
 
+    // Opt-in Phase 2A trace of the exact router IDs already read by the cache callback.
+    // Disabled by default: no extra GPU readbacks or synchronization.
+    std::FILE * trace_file = nullptr;
+    std::vector<uint64_t> trace_layer_calls;
+
     // slot maps in host memory
     ggml_context_ptr ctx_host;
     ggml_backend_buffer_ptr buf_host;
@@ -220,6 +229,15 @@ struct llama_moe_cache::impl {
 
     impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size) :
             n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()) {
+        if (const char * path = std::getenv("MOE_TRACE_PATH"); path && path[0] != '\0') {
+            trace_file = std::fopen(path, "a");
+            if (trace_file == nullptr) {
+                LLAMA_LOG_WARN("moe_trace: unable to open %s; trace disabled\n", path);
+            } else {
+                trace_layer_calls.resize(layers.size(), 0);
+                LLAMA_LOG_INFO("moe_trace: writing router selection and cache data to %s\n", path);
+            }
+        }
         for (size_t i = 0; i < backends.size(); ++i) {
             const auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backends[i]));
             if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU || dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
@@ -457,6 +475,9 @@ struct llama_moe_cache::impl {
 
     ~impl() {
         log_stats();
+        if (trace_file != nullptr) {
+            std::fclose(trace_file);
+        }
     }
 
     ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used) const {
@@ -545,14 +566,18 @@ struct llama_moe_cache::impl {
         }
         GGML_ASSERT(ggml_is_contiguous(sel));
 
+        const auto t_read_begin = std::chrono::steady_clock::now();
         ids.resize(ggml_nelements(sel));
         ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
         ggml_backend_synchronize(backend);
+        const auto t_read_end = std::chrono::steady_clock::now();
 
         size_t n_hit = 0;
         if (!g.lru.plan(il, ids.data(), ids.size(), fills, n_hit)) {
             GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
         }
+
+        const auto t_plan_end = std::chrono::steady_clock::now();
 
         // upload the missing experts, consecutive experts going to consecutive slots are uploaded together
         size_t bytes = 0;
@@ -578,6 +603,45 @@ struct llama_moe_cache::impl {
 
         // the next copy synchronizes the backend before it changes the slot map again
         ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
+
+        if (trace_file != nullptr) {
+            const auto t_enqueue_end = std::chrono::steady_clock::now();
+            const auto elapsed_us = [](auto from, auto to) -> int64_t {
+                return std::chrono::duration_cast<std::chrono::microseconds>(to - from).count();
+            };
+            // IDs are flattened in token-major order; reshape using tokens and k in the JSONL.
+            // Hits/misses count DISTINCT experts for this layer invocation, not each top-k ID.
+            // enqueue_us measures CPU-side submission only, NOT completion of the GPU DMA.
+            std::ostringstream line;
+            line << "{\"event\":\"moe_selection\",\"layer\":" << il
+                 << ",\"call\":" << trace_layer_calls[il]++
+                 << ",\"tokens\":" << sel->ne[1]
+                 << ",\"k\":" << sel->ne[0]
+                 << ",\"expert_ids\":[";
+            for (size_t i = 0; i < ids.size(); ++i) {
+                if (i != 0) {
+                    line << ',';
+                }
+                line << ids[i];
+            }
+            line << "],\"cache_hits\":" << n_hit
+                 << ",\"cache_misses\":" << fills.size()
+                 << ",\"missing_expert_ids\":[";
+            for (size_t i = 0; i < fills.size(); ++i) {
+                if (i != 0) {
+                    line << ',';
+                }
+                line << fills[i].expert;
+            }
+            line << "],\"upload_bytes\":" << bytes
+                 << ",\"readback_sync_us\":" << elapsed_us(t_read_begin, t_read_end)
+                 << ",\"cache_plan_us\":" << elapsed_us(t_read_end, t_plan_end)
+                 << ",\"enqueue_us\":" << elapsed_us(t_plan_end, t_enqueue_end)
+                 << "}\n";
+            const std::string record = line.str();
+            std::fwrite(record.data(), 1, record.size(), trace_file);
+            std::fflush(trace_file);
+        }
 
         return true;
     }
