@@ -1,0 +1,133 @@
+name: Build Windows CUDA (RTX 3060)
+
+# Builds CUDA executables remotely. No local CUDA Toolkit or MSVC installation is required.
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths:
+      - '.github/workflows/windows-cuda-rtx3060.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: moe-windows-cuda-sm86
+  cancel-in-progress: true
+
+jobs:
+  windows-cuda:
+    name: Windows x64 / CUDA 12.4 / SM 86
+    runs-on: windows-2022
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      # Reuse llama.cpp's own Windows CUDA setup script, already present in the repository.
+      - name: Install CUDA Toolkit 12.4
+        uses: ./.github/actions/windows-setup-cuda
+        with:
+          cuda_version: '12.4'
+          cuda_arch: 'x64'
+
+      - name: Install Ninja
+        shell: pwsh
+        run: choco install ninja --yes --no-progress
+
+      - name: Configure and compile llama-cli, llama-server and CUDA backend
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          if errorlevel 1 exit /b 1
+
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -DCMAKE_CUDA_ARCHITECTURES=86 ^
+            -DGGML_CUDA_CCCL_VERSION=v3.4.3 ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_CPU=ON ^
+            -DGGML_CUDA=ON ^
+            -DLLAMA_OPENSSL=OFF ^
+            -DLLAMA_BUILD_UI=OFF ^
+            -DLLAMA_BUILD_TESTS=OFF ^
+            -DLLAMA_BUILD_EXAMPLES=OFF
+          if errorlevel 1 exit /b 1
+
+          cmake --build build --config Release --parallel 3 --target llama-cli llama-server ggml-cuda
+          if errorlevel 1 exit /b 1
+
+      - name: Package executables and all necessary DLLs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $src = Join-Path $PWD "build\bin\Release"
+          $dst = Join-Path $PWD "dist"
+          New-Item -ItemType Directory -Path $dst -Force | Out-Null
+
+          foreach ($name in @("llama-cli.exe", "llama-server.exe")) {
+            $file = Join-Path $src $name
+            if (-not (Test-Path $file)) { throw "Missing executable: $file" }
+            Copy-Item -LiteralPath $file -Destination $dst -Force
+          }
+
+          $builtDlls = @(Get-ChildItem -Path $src -Filter "*.dll" -File)
+          if ($builtDlls.Count -eq 0) { throw "The build produced no DLLs" }
+          $builtDlls | Copy-Item -Destination $dst -Force
+
+          if (-not (Test-Path (Join-Path $dst "ggml-cuda.dll"))) {
+            throw "Missing ggml-cuda.dll. The CUDA backend was not built."
+          }
+
+          # The runtime libraries must be beside the executables to avoid missing-DLL errors.
+          if (-not $env:CUDA_PATH) { throw "CUDA_PATH is not set" }
+          $cudaRoots = @(
+            (Join-Path $env:CUDA_PATH "bin"),
+            (Join-Path $env:CUDA_PATH "lib"),
+            (Join-Path $env:CUDA_PATH "bin\x64")
+          )
+          $requiredPatterns = @("cudart64*.dll", "cublas64*.dll", "cublasLt64*.dll")
+          $optionalPatterns = @("nvrtc64*.dll", "nvrtc-builtins64*.dll", "nvJitLink*.dll")
+          foreach ($pattern in ($requiredPatterns + $optionalPatterns)) {
+            $matches = @(
+              foreach ($root in $cudaRoots) {
+                if (Test-Path $root) {
+                  Get-ChildItem -Path $root -File -Filter $pattern -ErrorAction Stop
+                }
+              }
+            )
+            if ($matches.Count -eq 0 -and $requiredPatterns -contains $pattern) {
+              throw "Missing required CUDA runtime DLL matching $pattern"
+            }
+            foreach ($file in $matches) {
+              Copy-Item -LiteralPath $file.FullName -Destination $dst -Force
+            }
+          }
+
+          @(
+            "moe-predictive-streaming - Windows CUDA build",
+            "GPU target: NVIDIA RTX 3060 (CUDA compute capability 8.6 / SM86)",
+            "Build source commit: $env:GITHUB_SHA",
+            "CUDA Toolkit: 12.4",
+            "",
+            "Keep all .exe and .dll files together in one folder.",
+            "Requires up-to-date NVIDIA graphics drivers and Microsoft Visual C++ runtime.",
+            "Models (.gguf) are not included.",
+            "",
+            "To check flags: .\llama-cli.exe --help",
+            "To run Ling Tiny: .\llama-cli.exe -m D:\Models\Ling-3.0-tiny-Q8_0.gguf -ngl 99 -c 2048 -n 128",
+            "For MoE cache experiments: add -cmoe --moe-cache-mib 1024"
+          ) | Set-Content -Path (Join-Path $dst "README.txt") -Encoding UTF8
+
+          Write-Host "Packaged files:"
+          Get-ChildItem -Path $dst | Select-Object Name, @{Name="SizeMB";Expression={[math]::Round($_.Length / 1MB, 2)}} | Format-Table -AutoSize
+
+      # GitHub automatically downloads the artifact as a ZIP containing these files.
+      - name: Upload ready-to-run Windows package
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-win-cuda-rtx3060
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
