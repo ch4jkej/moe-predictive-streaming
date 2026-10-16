@@ -1,0 +1,39 @@
+name: Phase 5 C++ integration smoke build
+on:
+  push:
+    branches: [phase5-ssd-ram-vram]
+    paths:
+      - 'src/**'
+      - 'common/**'
+      - 'include/**'
+      - '.github/workflows/phase5-compile-check.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: phase5-cpu-check-${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  native-cpp:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Ninja and C++ build prerequisites
+        run: sudo apt-get update -qq && sudo apt-get install -y ninja-build
+      - name: Configure CPU-only build
+        run: >
+          cmake -S . -B build-phase5-smoke -G Ninja
+          -DGGML_CUDA=OFF
+          -DGGML_NATIVE=OFF
+          -DGGML_BACKEND_DL=OFF
+          -DLLAMA_BUILD_TESTS=OFF
+          -DLLAMA_BUILD_EXAMPLES=OFF
+          -DLLAMA_BUILD_UI=OFF
+          -DLLAMA_OPENSSL=OFF
+          -DCMAKE_BUILD_TYPE=Release
+      - name: Compile llama core
+        run: cmake --build build-phase5-smoke --parallel 3 --target llama
