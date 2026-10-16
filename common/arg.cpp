@@ -2804,6 +2804,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_STREAM_CACHE"));
     add_opt(common_arg(
+        {"--moe-stream-ram-cache-mib"}, "N",
+        "maximum RAM used for dynamic MoE expert read-through cache in MiB; separate from device cache (default: 0)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("RAM expert cache budget must not be negative");
+            }
+            params.moe_stream = true;
+            params.moe_stream_ram_cache_budget = (uint64_t) value*1024ull*1024ull;
+        }
+    ).set_env("LLAMA_ARG_MOE_STREAM_RAM_CACHE_MIB"));
+    add_opt(common_arg(
         {"--moe-stream-io-threads"}, "N",
         "I/O threads for --moe-stream expert loads; implies --moe-stream (default: auto)",
         [](common_params & params, int value) {
