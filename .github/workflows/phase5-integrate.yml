@@ -1,0 +1,37 @@
+name: Phase 5 - Import upstream SSD streaming PR
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [phase5-ssd-ram-vram]
+    paths:
+      - '.github/workflows/phase5-integrate.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  integrate:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: phase5-ssd-ram-vram
+          fetch-depth: 0
+      - name: Attempt native three-way merge of upstream streaming PR
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch --no-tags https://github.com/ggml-org/llama.cpp.git refs/pull/25294/head
+          if ! git merge --no-commit --no-ff FETCH_HEAD; then
+            echo "::error::Upstream PR requires manual forward port. Do not force-merge."
+            git status --short
+            echo "Files with unmerged conflicts:"
+            git diff --name-only --diff-filter=U
+            exit 1
+          fi
+          git commit -m "feat(phase5): import upstream PR 25294 MoE SSD streaming"
+          git push origin HEAD:phase5-ssd-ram-vram
