@@ -158,7 +158,7 @@ struct llama_moe_stream {
     // payload bytes; worker staging and bookkeeping are tracked separately.
     size_t ram_cache_budget = 0;
     size_t ram_cache_used = 0;
-    std::mutex ram_cache_mtx;
+    mutable std::mutex ram_cache_mtx;
     std::list<uint64_t> ram_cache_lru;
     std::unordered_map<uint64_t, ram_entry> ram_cache;
     uint64_t ram_hits = 0, ram_misses = 0, ram_evictions = 0, disk_read_bytes = 0;
