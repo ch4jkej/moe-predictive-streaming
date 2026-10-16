@@ -2796,6 +2796,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             if (suffix == "s" || suffix == "slot" || suffix == "slots") {
                 params.moe_stream_slots = n;
+            } else if (suffix == "m" || suffix == "mb" || suffix == "mib") {
+                params.moe_stream_budget = n * 1024ull * 1024ull;
             } else if (suffix.empty() || suffix == "g" || suffix == "gb" || suffix == "gib") {
                 params.moe_stream_budget = n * 1024ull * 1024ull * 1024ull;
             } else {
