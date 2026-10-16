@@ -219,6 +219,13 @@ struct llama_moe_cache::impl {
     std::FILE * trace_file = nullptr;
     std::vector<uint64_t> trace_layer_calls;
 
+    // Phase 4 diagnostics: compact buffered CSV, opt-in, independent of JSONL tracing.
+    // Measurements are CPU wall times. drain_wait_us forces a backend synchronize and
+    // includes all outstanding work, not just the submitted expert copies.
+    std::FILE * phase4_file = nullptr;
+    std::vector<char> phase4_file_buffer;
+    bool phase4_force_sync = false;
+
     // slot maps in host memory
     ggml_context_ptr ctx_host;
     ggml_backend_buffer_ptr buf_host;
@@ -236,6 +243,21 @@ struct llama_moe_cache::impl {
             } else {
                 trace_layer_calls.resize(layers.size(), 0);
                 LLAMA_LOG_INFO("moe_trace: writing router selection and cache data to %s\n", path);
+            }
+        }
+        if (const char * path = std::getenv("MOE_PHASE4_PROFILE_PATH"); path && path[0] != '\0') {
+            phase4_file = std::fopen(path, "w");
+            if (phase4_file == nullptr) {
+                LLAMA_LOG_WARN("moe_phase4: unable to open %s; profile disabled\n", path);
+            } else {
+                phase4_file_buffer.resize(64*1024);
+                std::setvbuf(phase4_file, phase4_file_buffer.data(), _IOFBF, phase4_file_buffer.size());
+                phase4_force_sync = std::getenv("MOE_PHASE4_FORCE_SYNC") != nullptr &&
+                                    std::string(std::getenv("MOE_PHASE4_FORCE_SYNC")) == "1";
+                std::fprintf(phase4_file,
+                    "layer,id_count,cache_hits,cache_misses,upload_bytes,readback_sync_us,plan_us,submit_us,drain_wait_us\n");
+                LLAMA_LOG_INFO("moe_phase4: profiling to %s; forced backend sync=%d (intrusive!)\n",
+                    path, (int) phase4_force_sync);
             }
         }
         for (size_t i = 0; i < backends.size(); ++i) {
@@ -475,6 +497,9 @@ struct llama_moe_cache::impl {
 
     ~impl() {
         log_stats();
+        if (phase4_file != nullptr) {
+            std::fclose(phase4_file);
+        }
         if (trace_file != nullptr) {
             std::fclose(trace_file);
         }
@@ -603,6 +628,26 @@ struct llama_moe_cache::impl {
 
         // the next copy synchronizes the backend before it changes the slot map again
         ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
+        const auto t_submit_end = std::chrono::steady_clock::now();
+
+        if (phase4_file != nullptr) {
+            int64_t drain_wait_us = -1;
+            if (phase4_force_sync) {
+                const auto start = std::chrono::steady_clock::now();
+                ggml_backend_synchronize(backend);
+                drain_wait_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - start).count();
+            }
+            const auto us = [](auto a, auto b) -> int64_t {
+                return std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
+            };
+            std::fprintf(phase4_file, "%d,%zu,%zu,%zu,%zu,%lld,%lld,%lld,%lld\n",
+                il, ids.size(), n_hit, fills.size(), bytes,
+                (long long) us(t_read_begin, t_read_end),
+                (long long) us(t_read_end, t_plan_end),
+                (long long) us(t_plan_end, t_submit_end),
+                (long long) drain_wait_us);
+        }
 
         if (trace_file != nullptr) {
             const auto t_enqueue_end = std::chrono::steady_clock::now();
