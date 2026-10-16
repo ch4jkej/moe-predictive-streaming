@@ -36,9 +36,9 @@ $runs = @(
 Push-Location -LiteralPath $BinDir
 try {
     foreach ($run in $runs) {
-        $args = @($baseArgs)
+        $cliArgs = @($baseArgs)
         if ($run.streamed) {
-            $args += @('--moe-stream','--moe-stream-cache',([string]$GpuCacheMiB + 'm'),
+            $cliArgs += @('--moe-stream','--moe-stream-cache',([string]$GpuCacheMiB + 'm'),
                        '--moe-stream-ram-cache-mib',[string]$run.ram,
                        '--moe-stream-io-threads','8','--moe-stream-direct')
         }
@@ -47,7 +47,9 @@ try {
         $stderr = Join-Path $OutputDir "$name-stderr.txt"
         $start = (Get-Date).ToString('o')
         Write-Host ("Running {0} (RAM cache: {1} MiB)" -f $name, $run.ram)
-        & $exe @args 1> $stdout 2> $stderr
+        $ErrorActionPreference = 'Continue'
+        & $exe @cliArgs 1> $stdout 2> $stderr
+        $ErrorActionPreference = 'Stop'
         $exit = $LASTEXITCODE
         $end = (Get-Date).ToString('o')
         ('"{0}",{1},{2},{3},"{4}","{5}","{6}","{7}"' -f
