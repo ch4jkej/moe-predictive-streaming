@@ -8,6 +8,7 @@
 #include <cinttypes>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <stdexcept>
 
 #ifdef _WIN32
@@ -364,13 +365,13 @@ void llama_moe_stream::open_files(const std::vector<std::string> & paths) {
         return true;
     };
     if (use_direct_io && !open_windows(true)) {
-        LLAMA_LOG_WARN("%s: Windows unbuffered positional I/O unavailable, using buffered OVERLAPPED I/O\\n", __func__);
+        LLAMA_LOG_WARN("%s: Windows unbuffered positional I/O unavailable, using buffered OVERLAPPED I/O\n", __func__);
         use_direct_io = false;
     }
     if (!use_direct_io && !open_windows(false)) {
         throw std::runtime_error("MoE streaming: CreateFileW failed for Windows GGUF handles");
     }
-    LLAMA_LOG_INFO("%s: Windows OVERLAPPED expert reads enabled, NO_BUFFERING=%d\\n", __func__, (int) use_direct_io);
+    LLAMA_LOG_INFO("%s: Windows OVERLAPPED expert reads enabled, NO_BUFFERING=%d\n", __func__, (int) use_direct_io);
 #else
     open_all(use_direct_io);
 
@@ -384,14 +385,14 @@ void llama_moe_stream::open_files(const std::vector<std::string> & paths) {
             moe_aligned_free(probe);
         }
         if (!ok) {
-            LLAMA_LOG_WARN("%s: O_DIRECT unavailable, using buffered streaming reads\\n", __func__);
+            LLAMA_LOG_WARN("%s: O_DIRECT unavailable, using buffered streaming reads\n", __func__);
             use_direct_io = false;
             open_all(false);
         }
     }
 #endif
     if (use_direct_io) {
-        LLAMA_LOG_INFO("%s: MoE streaming uses direct disk reads\\n", __func__);
+        LLAMA_LOG_INFO("%s: MoE streaming uses direct disk reads\n", __func__);
     }
 
     // one token drives ~one remap per streamed layer, so decaying every 64 tokens is
