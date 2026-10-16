@@ -117,6 +117,9 @@ jobs:
           @(
             "moe-predictive-streaming - Windows CUDA build",
             "GPU target: NVIDIA RTX 3060 (CUDA compute capability 8.6 / SM86)",
+            "Phase 5 experimental: streamed experts with separate GPU and bounded dynamic RAM caches.",
+            "Use --moe-stream --moe-stream-cache 512m --moe-stream-ram-cache-mib 4096 --moe-stream-direct",
+            "Do not combine --cpu-moe with --moe-stream. This branch is experimental and requires output validation.",
             "Build source commit: $env:GITHUB_SHA",
             "CUDA Toolkit: 12.4",
             "",
