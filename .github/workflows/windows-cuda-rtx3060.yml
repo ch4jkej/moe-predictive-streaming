@@ -4,18 +4,24 @@ name: Build Windows CUDA (RTX 3060)
 on:
   workflow_dispatch:
   push:
-    branches: [master]
+    branches: [master, phase5-ssd-ram-vram]
     paths:
       - '.github/workflows/windows-cuda-rtx3060.yml'
       - 'src/llama-moe-cache.cpp'
       - 'src/llama-moe-cache.h'
+      - 'src/llama-moe-stream.cpp'
+      - 'src/llama-moe-stream.h'
+      - 'src/llama-graph.cpp'
+      - 'src/llama-model.cpp'
+      - 'src/CMakeLists.txt'
+      - 'common/arg.cpp'
       - 'tools/moe-phase4/**'
 
 permissions:
   contents: read
 
 concurrency:
-  group: moe-windows-cuda-sm86
+  group: moe-windows-cuda-sm86-${{ github.ref_name }}
   cancel-in-progress: true
 
 jobs:
@@ -145,7 +151,7 @@ jobs:
       - name: Upload ready-to-run Windows package
         uses: actions/upload-artifact@v4
         with:
-          name: llama-win-cuda-rtx3060
+          name: llama-win-cuda-${{ github.ref_name }}-rtx3060
           path: dist/
           if-no-files-found: error
           retention-days: 14
