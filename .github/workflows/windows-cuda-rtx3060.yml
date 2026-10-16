@@ -9,6 +9,7 @@ on:
       - '.github/workflows/windows-cuda-rtx3060.yml'
       - 'src/llama-moe-cache.cpp'
       - 'src/llama-moe-cache.h'
+      - 'tools/moe-phase4/**'
 
 permissions:
   contents: read
@@ -60,6 +61,15 @@ jobs:
           cmake --build build --config Release --parallel 3 --target llama-cli llama-server ggml-cuda
           if errorlevel 1 exit /b 1
 
+      - name: Compile standalone Phase 4 NVMe and CUDA benchmark
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          if errorlevel 1 exit /b 1
+          "%CUDA_PATH%\bin\nvcc.exe" -std=c++17 -O2 -arch=sm_86 -Xcompiler "/EHsc" ^
+            -o "build\bin\Release\moe-phase4-probe.exe" "tools\moe-phase4\moe-phase4-probe.cu"
+          if errorlevel 1 exit /b 1
+
       - name: Package executables and all necessary DLLs
         shell: pwsh
         run: |
@@ -68,7 +78,7 @@ jobs:
           $dst = Join-Path $PWD "dist"
           New-Item -ItemType Directory -Path $dst -Force | Out-Null
 
-          foreach ($name in @("llama-cli.exe", "llama-server.exe")) {
+          foreach ($name in @("llama-cli.exe", "llama-server.exe", "moe-phase4-probe.exe")) {
             $file = Join-Path $src $name
             if (-not (Test-Path $file)) { throw "Missing executable: $file" }
             Copy-Item -LiteralPath $file -Destination $dst -Force
@@ -121,7 +131,11 @@ jobs:
             "",
             "To check flags: .\llama-cli.exe --help",
             "To run Ling Tiny: .\llama-cli.exe -m D:\Models\Ling-3.0-tiny-Q8_0.gguf -ngl 99 -c 2048 -n 128",
-            "For MoE cache experiments: add -cmoe --moe-cache-mib 1024"
+            "For MoE cache experiments: add -cmoe --moe-cache-mib 1024",
+            "Phase 4: set MOE_PHASE4_PROFILE_PATH to a unique local CSV file, with -cmoe and a nonzero --moe-cache-mib.",
+            "Phase 4 intrusive diagnostic: set MOE_PHASE4_FORCE_SYNC=1 together with MOE_PHASE4_PROFILE_PATH.",
+            "Phase 4 NVMe and H2D probe: .\moe-phase4-probe.exe D:\Models\Ling-3.0-tiny-Q8_0.gguf > probe.csv",
+            "The probe opens the provided file read-only, using FILE_FLAG_NO_BUFFERING."
           ) | Set-Content -Path (Join-Path $dst "README.txt") -Encoding UTF8
 
           Write-Host "Packaged files:"
