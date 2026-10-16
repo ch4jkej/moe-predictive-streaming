@@ -350,7 +350,8 @@ extern "C" {
         // SSD streaming of MoE routed expert weights (experts are paged from the GGUF on demand
         // into a per-layer cache of moe_stream_slots experts; requires moe_stream = true)
         uint32_t moe_stream_slots;      // expert cache slots per streamed layer (0 = auto)
-        uint64_t moe_stream_budget;     // total cache byte budget, used when slots == 0 (0 = auto heuristic)
+        uint64_t moe_stream_budget;     // total GPU cache byte budget, used when slots == 0 (0 = auto heuristic)
+        uint64_t moe_stream_ram_cache_budget; // total RAM payload byte budget; 0 disables RAM cache
         int32_t  moe_stream_io_threads; // expert load I/O threads (<= 0 = default)
         bool     moe_stream_direct;     // use O_DIRECT for expert reads (bypass page cache); falls back if unsupported
 
