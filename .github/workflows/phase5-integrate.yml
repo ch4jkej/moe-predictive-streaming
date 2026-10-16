@@ -26,12 +26,13 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git fetch --no-tags https://github.com/ggml-org/llama.cpp.git refs/pull/25294/head
-          if ! git merge --no-commit --no-ff FETCH_HEAD; then
+          if ! git merge --no-commit --no-ff -X theirs FETCH_HEAD; then
             echo "::error::Upstream PR requires manual forward port. Do not force-merge."
             git status --short
             echo "Files with unmerged conflicts:"
             git diff --name-only --diff-filter=U
             exit 1
           fi
-          git commit -m "feat(phase5): import upstream PR 25294 MoE SSD streaming"
+          git diff --cached --check
+          git commit -m "feat(phase5): forward-port upstream PR 25294 MoE SSD streaming (review needed)"
           git push origin HEAD:phase5-ssd-ram-vram
