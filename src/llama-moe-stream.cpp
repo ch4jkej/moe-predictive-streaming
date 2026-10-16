@@ -11,6 +11,8 @@
 #include <stdexcept>
 
 #ifdef _WIN32
+#define NOMINMAX
+#include <windows.h>
 #include <malloc.h>
 #else
 #include <fcntl.h>
@@ -110,6 +112,64 @@ static const uint8_t * llama_moe_stream_pread(llama_file & file, uint8_t * stagi
 #endif
 }
 
+#ifdef _WIN32
+// Native Windows direct or buffered positional I/O. Each worker uses its own
+// OVERLAPPED; unlike the upstream fallback, there is no global seek mutex.
+// Direct reads align offset, size and buffer to the filesystem sector.
+static const uint8_t * llama_moe_stream_win_pread(
+        HANDLE file, uint8_t * staging, size_t len, size_t offs, bool direct) {
+    if (file == INVALID_HANDLE_VALUE || file == nullptr) {
+        return nullptr;
+    }
+    const size_t alignment = direct ? MOE_STREAM_DIRECT_ALIGN : 1;
+    const size_t base = (offs/alignment)*alignment;
+    const size_t head = offs - base;
+    const size_t n = ((head + len + alignment - 1)/alignment)*alignment;
+    if (n > MAXDWORD) {
+        return nullptr;
+    }
+    OVERLAPPED ov{};
+    ov.Offset = (DWORD) (base & 0xffffffffULL);
+    ov.OffsetHigh = (DWORD) (base >> 32);
+    ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (ov.hEvent == nullptr) {
+        return nullptr;
+    }
+    BOOL ok = ReadFile(file, staging, (DWORD) n, nullptr, &ov);
+    if (!ok && GetLastError() != ERROR_IO_PENDING) {
+        CloseHandle(ov.hEvent);
+        return nullptr;
+    }
+    DWORD completed = 0;
+    ok = GetOverlappedResult(file, &ov, &completed, TRUE);
+    CloseHandle(ov.hEvent);
+    if (!ok || (size_t) completed < head + len) {
+        return nullptr;
+    }
+    return staging + head;
+}
+
+static std::wstring llama_moe_stream_win_path(const std::string & utf8_path) {
+    int cp = CP_UTF8;
+    int flags = MB_ERR_INVALID_CHARS;
+    int n = MultiByteToWideChar(cp, flags, utf8_path.c_str(), -1, nullptr, 0);
+    if (n == 0) {
+        cp = CP_ACP;
+        flags = 0;
+        n = MultiByteToWideChar(cp, flags, utf8_path.c_str(), -1, nullptr, 0);
+    }
+    if (n == 0) {
+        throw std::runtime_error("MoE streaming: unable to decode Windows file path");
+    }
+    std::wstring path((size_t) n, L'\0');
+    if (!MultiByteToWideChar(cp, flags, utf8_path.c_str(), -1, &path[0], n)) {
+        throw std::runtime_error("MoE streaming: unable to convert Windows file path");
+    }
+    path.pop_back(); // remove terminal NUL stored by MultiByteToWideChar
+    return path;
+}
+#endif
+
 // true iff all of the given exps tensors are this layer's cache tensors - guards against a second,
 // non-streamed expert group on the same layer index (e.g. grovemoe chexps)
 bool llama_moe_stream_layer::matches(const ggml_tensor * gate, const ggml_tensor * up,
@@ -138,7 +198,7 @@ bool llama_moe_stream_layer::matches(const ggml_tensor * gate, const ggml_tensor
 }
 
 // sizes the per-layer table and clamps the I/O thread count; workers are spawned lazily on first use
-llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n_io_threads, bool direct) : n_slots(n_slots) {
+llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n_io_threads, bool direct, size_t ram_budget) : n_slots(n_slots), ram_cache_budget(ram_budget) {
     layers.resize(n_layer);
 
     this->n_io_threads = n_io_threads <= 0 ? MOE_STREAM_IO_THREADS_DEFAULT : n_io_threads;
@@ -159,6 +219,13 @@ llama_moe_stream::~llama_moe_stream() {
     for (auto & w : workers) {
         w.join();
     }
+#ifdef _WIN32
+    for (void * h : windows_file_handles) {
+        if (h != nullptr && (HANDLE) h != INVALID_HANDLE_VALUE) {
+            CloseHandle((HANDLE) h);
+        }
+    }
+#endif
 }
 
 ggml_tensor * llama_moe_stream::create_cache_tensor(
@@ -263,29 +330,68 @@ void llama_moe_stream::open_files(const std::vector<std::string> & paths) {
         }
     };
 
+#ifdef _WIN32
+    // The generic llama_file is used for metadata only. Expert reads use
+    // independent OVERLAPPED Win32 handles (optionally NO_BUFFERING).
+    open_all(false);
+    auto open_windows = [&](bool direct) -> bool {
+        for (void * h : windows_file_handles) {
+            if (h != nullptr && (HANDLE) h != INVALID_HANDLE_VALUE) {
+                CloseHandle((HANDLE) h);
+            }
+        }
+        windows_file_handles.clear();
+        for (const auto & path : paths) {
+            const std::wstring wpath = llama_moe_stream_win_path(path);
+            const DWORD flags = FILE_FLAG_OVERLAPPED | (direct ? FILE_FLAG_NO_BUFFERING : 0);
+            HANDLE h = CreateFileW(wpath.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                   nullptr, OPEN_EXISTING, flags, nullptr);
+            if (h == INVALID_HANDLE_VALUE) {
+                return false;
+            }
+            windows_file_handles.push_back((void *) h);
+        }
+        if (direct && !windows_file_handles.empty()) {
+            uint8_t * probe = (uint8_t *) moe_aligned_alloc(MOE_STREAM_DIRECT_ALIGN*2);
+            const bool ok = probe != nullptr &&
+                llama_moe_stream_win_pread((HANDLE) windows_file_handles.front(), probe,
+                                          MOE_STREAM_DIRECT_ALIGN, 0, true) != nullptr;
+            moe_aligned_free(probe);
+            if (!ok) {
+                return false;
+            }
+        }
+        return true;
+    };
+    if (use_direct_io && !open_windows(true)) {
+        LLAMA_LOG_WARN("%s: Windows unbuffered positional I/O unavailable, using buffered OVERLAPPED I/O\\n", __func__);
+        use_direct_io = false;
+    }
+    if (!use_direct_io && !open_windows(false)) {
+        throw std::runtime_error("MoE streaming: CreateFileW failed for Windows GGUF handles");
+    }
+    LLAMA_LOG_INFO("%s: Windows OVERLAPPED expert reads enabled, NO_BUFFERING=%d\\n", __func__, (int) use_direct_io);
+#else
     open_all(use_direct_io);
 
-    // fall back to buffered when O_DIRECT is unusable: either the open did not honor it (macOS,
-    // Windows, unsupported filesystems), or it opened but a probe read fails (some network/overlay
-    // filesystems accept the flag then reject aligned reads). reopening is needed because O_DIRECT
-    // is a property of the fd. done here, single-threaded, before any worker starts.
+    // Fall back to buffered streaming when O_DIRECT cannot be used.
     if (use_direct_io) {
         bool ok = !files.empty() && files.front()->has_direct_io();
         if (ok) {
             uint8_t * probe = (uint8_t *) moe_aligned_alloc(MOE_STREAM_DIRECT_ALIGN);
             GGML_ASSERT(probe != nullptr);
-            ok = llama_moe_stream_pread(*files.front(), probe, MOE_STREAM_DIRECT_ALIGN, 0, /*direct =*/ true) != nullptr;
+            ok = llama_moe_stream_pread(*files.front(), probe, MOE_STREAM_DIRECT_ALIGN, 0, true) != nullptr;
             moe_aligned_free(probe);
         }
         if (!ok) {
-            LLAMA_LOG_WARN("%s: O_DIRECT not usable, falling back to buffered streaming reads\n", __func__);
+            LLAMA_LOG_WARN("%s: O_DIRECT unavailable, using buffered streaming reads\\n", __func__);
             use_direct_io = false;
             open_all(false);
         }
     }
-
+#endif
     if (use_direct_io) {
-        LLAMA_LOG_INFO("%s: MoE expert streaming uses O_DIRECT (page cache bypassed)\n", __func__);
+        LLAMA_LOG_INFO("%s: MoE streaming uses direct disk reads\\n", __func__);
     }
 
     // one token drives ~one remap per streamed layer, so decaying every 64 tokens is
@@ -339,13 +445,85 @@ void llama_moe_stream::worker_loop() {
         lk.unlock();
 
         bool ok = true;
+        const uint64_t ram_key = ((uint64_t) (uint32_t) sl.il << 32) | (uint32_t) w.expert;
+        size_t expert_total_bytes = 0;
         for (const auto & wt : sl.weights) {
-            const uint8_t * data = llama_moe_stream_pread(*files[wt.file_idx], staging, wt.nb_expert, wt.offs + (size_t) w.expert*wt.nb_expert, use_direct_io);
-            if (data == nullptr) {
-                ok = false;
-                break;
+            expert_total_bytes += wt.nb_expert;
+        }
+        const bool ram_eligible = ram_cache_budget >= expert_total_bytes && expert_total_bytes > 0;
+        std::vector<uint8_t> resident_bytes;
+        if (ram_eligible) {
+            std::lock_guard<std::mutex> ram_lock(ram_cache_mtx);
+            auto it = ram_cache.find(ram_key);
+            if (it != ram_cache.end()) {
+                resident_bytes = it->second.data; // bounded worker-local copy; safe under concurrent LRU eviction
+                ram_cache_lru.splice(ram_cache_lru.end(), ram_cache_lru, it->second.lru_position);
+                ++ram_hits;
+            } else {
+                ++ram_misses;
             }
-            ggml_backend_tensor_set(wt.cache, data, (size_t) w.slot*wt.nb_expert, wt.nb_expert);
+        }
+        if (!resident_bytes.empty()) {
+            size_t pos = 0;
+            for (const auto & wt : sl.weights) {
+                // ggml_backend_tensor_set() is synchronous: resident_bytes remains live until completion.
+                ggml_backend_tensor_set(wt.cache, resident_bytes.data() + pos,
+                                        (size_t) w.slot*wt.nb_expert, wt.nb_expert);
+                pos += wt.nb_expert;
+            }
+        } else {
+            // Cache a complete (layer,expert), not individual weight tensors: a hit
+            // guarantees gate/up/down all come from the same original GGUF slab.
+            std::vector<uint8_t> to_cache;
+            if (ram_eligible) {
+                to_cache.resize(expert_total_bytes);
+            }
+            size_t pos = 0;
+            uint64_t bytes_read = 0;
+            for (const auto & wt : sl.weights) {
+#ifdef _WIN32
+                const uint8_t * data = llama_moe_stream_win_pread(
+                    (HANDLE) windows_file_handles[wt.file_idx], staging, wt.nb_expert,
+                    wt.offs + (size_t) w.expert*wt.nb_expert, use_direct_io);
+#else
+                const uint8_t * data = llama_moe_stream_pread(
+                    *files[wt.file_idx], staging, wt.nb_expert,
+                    wt.offs + (size_t) w.expert*wt.nb_expert, use_direct_io);
+#endif
+                if (data == nullptr) {
+                    ok = false;
+                    break;
+                }
+                bytes_read += wt.nb_expert;
+                if (ram_eligible) {
+                    std::memcpy(to_cache.data() + pos, data, wt.nb_expert);
+                }
+                pos += wt.nb_expert;
+                ggml_backend_tensor_set(wt.cache, data, (size_t) w.slot*wt.nb_expert, wt.nb_expert);
+            }
+
+            std::lock_guard<std::mutex> ram_lock(ram_cache_mtx);
+            disk_read_bytes += bytes_read;
+            if (ok && ram_eligible && ram_cache.find(ram_key) == ram_cache.end()) {
+                // Evict LRU RAM entries, globally across all layers, until this
+                // expert fits in the independently configured RAM payload budget.
+                while (ram_cache_used > ram_cache_budget - expert_total_bytes && !ram_cache_lru.empty()) {
+                    const uint64_t victim_key = ram_cache_lru.front();
+                    auto victim = ram_cache.find(victim_key);
+                    if (victim != ram_cache.end()) {
+                        ram_cache_used -= victim->second.data.size();
+                        ram_cache.erase(victim);
+                        ++ram_evictions;
+                    }
+                    ram_cache_lru.pop_front();
+                }
+                ram_cache_lru.push_back(ram_key);
+                ram_entry entry;
+                entry.data = std::move(to_cache);
+                entry.lru_position = std::prev(ram_cache_lru.end());
+                ram_cache_used += entry.data.size();
+                ram_cache.emplace(ram_key, std::move(entry));
+            }
         }
 
         lk.lock();
@@ -424,6 +602,13 @@ void llama_moe_stream::print_stats() const {
             n_touched > 0 ? 100.0*stats.n_hit/n_touched : 0.0);
     LLAMA_LOG_INFO("%s: moe stream: load stall = %.2f ms total (%.3f ms per remap call)\n",
             __func__, stats.t_stall_us/1000.0, stats.n_calls > 0 ? stats.t_stall_us/1000.0/stats.n_calls : 0.0);
+    {
+        std::lock_guard<std::mutex> ram_lock(ram_cache_mtx);
+        LLAMA_LOG_INFO("%s: expert RAM cache: configured=%zu MiB, resident=%.2f MiB, hits=%llu, misses=%llu, evictions=%llu, GGUF read=%.2f MiB\\n",
+            __func__, ram_cache_budget/(1024*1024), ram_cache_used/1048576.0,
+            (unsigned long long) ram_hits, (unsigned long long) ram_misses,
+            (unsigned long long) ram_evictions, disk_read_bytes/1048576.0);
+    }
     if (stats.n_wave_calls > 0) {
         LLAMA_LOG_INFO("%s: moe stream: waves = %" PRId64 " (%" PRId64 " non-empty), preloads issued = %" PRId64 " (ready on arrival = %" PRId64 "), wave stall = %.2f ms\n",
                 __func__, stats.n_wave_calls, stats.n_waves_run, stats.n_preload_issued, stats.n_preload_ready, stats.t_stall_wave_us/1000.0);
