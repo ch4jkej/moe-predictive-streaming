@@ -7,6 +7,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -118,7 +119,7 @@ struct llama_moe_stream {
 
     std::vector<std::unique_ptr<llama_moe_stream_layer>> layers; // [n_layer], null = not streamed
 
-    llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n_io_threads, bool direct);
+    llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n_io_threads, bool direct, size_t ram_cache_budget);
     ~llama_moe_stream();
 
     llama_moe_stream_layer * layer(int32_t il) const {
@@ -143,6 +144,24 @@ struct llama_moe_stream {
     bool use_direct_io = false; // O_DIRECT streaming reads (LLAMA_MOE_STREAM_DIRECT), no page cache
 
     llama_files files; // privately reopened GGUF files, same indices as the loader's
+
+#ifdef _WIN32
+    // Windows OVERLAPPED handles permit independent positional I/O from concurrent workers.
+    std::vector<void *> windows_file_handles;
+#endif
+
+    struct ram_entry {
+        std::vector<uint8_t> data; // complete expert slab collection for one (layer, expert)
+        std::list<uint64_t>::iterator lru_position;
+    };
+    // RAM read-through LRU is separate from the per-layer GPU cache. Capacity counts
+    // payload bytes; worker staging and bookkeeping are tracked separately.
+    size_t ram_cache_budget = 0;
+    size_t ram_cache_used = 0;
+    std::mutex ram_cache_mtx;
+    std::list<uint64_t> ram_cache_lru;
+    std::unordered_map<uint64_t, ram_entry> ram_cache;
+    uint64_t ram_hits = 0, ram_misses = 0, ram_evictions = 0, disk_read_bytes = 0;
 
     size_t  max_nb_expert      = 0;
     int64_t hot_decay_interval = 0; // remap calls between route-hotness halvings (0 = no decay)
