@@ -1,4 +1,4 @@
-name: Build Windows CUDA (RTX 3060)
+name: Build Windows CUDA (RTX 3060) # Phase 5 integration verification
 
 # Builds CUDA executables remotely. No local CUDA Toolkit or MSVC installation is required.
 on:
