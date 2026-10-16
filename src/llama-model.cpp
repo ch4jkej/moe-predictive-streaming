@@ -2457,7 +2457,13 @@ void llama_model_base::load_tensors_hadamard() {
 }
 
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
-    const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
+    const buft_list_t * buft_list_layer = nullptr;
+    if (tn.bid != -1) {
+        // Keep modern llama.cpp routing for head blocks that are not model layers.
+        buft_list_layer = (size_t) tn.bid < pimpl->dev_layer.size()
+            ? pimpl->dev_layer.at(tn.bid).buft_list
+            : pimpl->dev_output.buft_list;
+    }
 
     // route MoE routed-expert weights to the streaming expert cache instead of materializing them
     if (pimpl->moe_stream && tn.bid >= 0 && buft_list_layer != nullptr &&
