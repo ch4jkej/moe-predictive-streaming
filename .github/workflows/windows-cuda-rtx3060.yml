@@ -7,15 +7,6 @@ on:
     branches: [master, phase5-ssd-ram-vram]
     paths:
       - '.github/workflows/windows-cuda-rtx3060.yml'
-      - 'src/llama-moe-cache.cpp'
-      - 'src/llama-moe-cache.h'
-      - 'src/llama-moe-stream.cpp'
-      - 'src/llama-moe-stream.h'
-      - 'src/llama-graph.cpp'
-      - 'src/llama-model.cpp'
-      - 'src/CMakeLists.txt'
-      - 'common/arg.cpp'
-      - 'tools/moe-phase4/**'
 
 permissions:
   contents: read
