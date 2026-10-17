@@ -6,6 +6,7 @@
 #include "llama-batch.h"
 #include "llama-cparams.h"
 #include "llama-moe-stream.h"
+#include "llama-sampler.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -1556,6 +1557,9 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     loras            (params.loras),
     mctx             (params.mctx),
     cross            (params.cross),
+    moe_cache        (params.moe_cache),
+    prec_policy      (params.prec_policy),
+    hdmd             (params.hdmd),
     mstream          (params.mstream),
     samplers         (params.samplers),
     cb_func          (params.cb),
@@ -1655,19 +1659,31 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * cur, // ggml_tensor * b
           ggml_tensor * ids,
           ggml_tensor * w_s,
-          ggml_tensor * ids_scale) const {
-    ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, ids);
+          ggml_tensor * slots,
+          ggml_tensor * stream_ids) const {
+    cur = build_hadamard_input(w, cur);
+    // the experts in the MoE cache are selected by their slots
+    // Preserve the original MoE GPU-cache path. SSD streaming remaps only the
+    // GEMM expert indices; LoRA and per-expert scales keep the original IDs.
+    ggml_tensor * res = stream_ids != nullptr ?
+        ggml_mul_mat_id(ctx0, w, cur, stream_ids) :
+        (slots == nullptr ? ggml_mul_mat_id(ctx0, w, cur, ids)
+                          : ggml_mul_mat_id(ctx0, moe_cache->get_experts(w), cur, slots));
+
+    if (prec_policy) {
+        prec_policy->apply(res);
+    }
+
+    if (w->type == GGML_TYPE_NVFP4) {
+        ggml_prec_set_acc(res, GGML_PREC_BF16);
+    }
 
     if (w_s) {
-        // w_s always covers all experts, so index it with the original expert ids
-        //   even when the GEMM ids are remapped cache slots (MoE streaming)
-        ggml_tensor * ids_s = ids_scale ? ids_scale : ids;
-
         const int64_t n_expert = w_s->ne[0];
         const int64_t n_tokens = cur->ne[2];
         ggml_tensor * s = ggml_reshape_3d(ctx0, w_s, 1, n_expert, 1);
         s = ggml_repeat_4d(ctx0, s, 1, n_expert, n_tokens, 1);
-        s = ggml_get_rows(ctx0, s, ids_s);
+        s = ggml_get_rows(ctx0, s, ids);
         res = ggml_mul(ctx0, res, s);
     }
     for (const auto & lora : *loras) {
@@ -2272,6 +2288,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
 
+    // The original host-resident MoE expert-cache path must remain functional
+    // when SSD streaming is disabled or this tensor group is not streamed.
+    ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il);
+
     // MoE expert streaming: make the selected experts cache-resident and remap the ids fed to the
     //   expert GEMMs to cache slots; the routing itself (weights, scales, biases) keeps the original ids
     llama_moe_stream_layer * msl = mstream ? mstream->layer(il) : nullptr;
@@ -2328,7 +2348,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     if (gate_up_exps) {
         // merged gate_up path: one mul_mat_id, then split into gate and up views
-        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, ids_gemm, up_exps_s, selected_experts); // [n_ff*2, n_expert_used, n_tokens]
+        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts, up_exps_s, slots, msl ? ids_gemm : nullptr); // [n_ff*2, n_expert_used, n_tokens]
         cb(gate_up, "ffn_moe_gate_up", il);
 
         if (up_exps_s) {
@@ -2347,7 +2367,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(up, "ffn_moe_up", il);
     } else {
         // separate gate and up path
-        up = build_lora_mm_id(up_exps, cur, ids_gemm, up_exps_s, selected_experts); // [n_ff, n_expert_used, n_tokens]
+        up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s, slots, msl ? ids_gemm : nullptr); // [n_ff, n_expert_used, n_tokens]
         cb(up, "ffn_moe_up", il);
 
         if (up_exps_s) {
@@ -2360,7 +2380,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         if (gate_exps) {
-            cur = build_lora_mm_id(gate_exps, cur, ids_gemm, gate_exps_s, selected_experts); // [n_ff, n_expert_used, n_tokens]
+            cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s, slots, msl ? ids_gemm : nullptr); // [n_ff, n_expert_used, n_tokens]
             cb(cur, "ffn_moe_gate", il);
         } else {
             cur = up;
@@ -2461,7 +2481,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             GGML_ABORT("fatal error");
     }
 
-    experts = build_lora_mm_id(down_exps, cur, ids_gemm, down_exps_s, selected_experts); // [n_embd, n_expert_used, n_tokens]
+    experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s, slots, msl ? ids_gemm : nullptr); // [n_embd, n_expert_used, n_tokens]
+    if (arch == LLM_ARCH_MISTRAL4) {
+        // Preserve upstream precision requirement; intermediate values can exceed F16.
+        ggml_prec_set_src(experts, GGML_PREC_F32, 1);
+    }
     cb(experts, "ffn_moe_down", il);
 
     if (down_exps_s) {
