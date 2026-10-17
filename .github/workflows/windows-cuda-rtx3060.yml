@@ -1,5 +1,5 @@
 name: Build Windows CUDA (RTX 3060) # Phase 5 integration verification
-# Phase 5 baseline regression fix passed C++ smoke: compile corrected original MoE + SSD/RAM/VRAM paths.
+# Phase 5 follow-up: compile GGUF/RAM residency counters for targeted wave-correctness diagnostics.
 
 # Builds CUDA executables remotely. No local CUDA Toolkit or MSVC installation is required.
 on:
