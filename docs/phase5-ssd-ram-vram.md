@@ -15,7 +15,7 @@ The GPU cache and RAM cache have **independent** capacity knobs. RAM-cache paylo
 ### CLI knobs
 
 - `--moe-stream`: enable SSD expert streaming.
-- `--moe-stream-cache 512m`: combined model-wide GPU expert-cache budget of 512 MiB, resolved to per-layer slots (rounding means actual allocation may differ).
+- `--moe-stream-cache 8s`: **minimum currently supported for Ling Tiny with `-ub 1`**: eight expert staging slots *per MoE layer*. This is NOT 8 slots shared globally; the current PR allocates cache tensors for every streamed MoE layer. Use `512m`, `1024m`, etc. only later when benchmarking larger caches.
 - `--moe-stream-ram-cache-mib 1024`: RAM expert LRU payload budget of 1024 MiB (0 disables the RAM cache).
 - `--moe-stream-io-threads 8`: number of concurrent I/O workers (default 9, max 18).
 - `--moe-stream-direct`: request Windows unbuffered overlapped positional I/O; falls back to buffered overlapped reads if unbuffered open/read fails.
@@ -25,6 +25,14 @@ The RAM option may also be supplied as environment variable `LLAMA_ARG_MOE_STREA
 **Do not combine `--cpu-moe` or the old `--moe-cache-mib` path with `--moe-stream` during initial validation.** Those options belong to a different caching implementation.
 
 The upstream PR uses per-layer GPU slot caches. In this phase, GPU caching is **not the older shared cross-layer LRU from Phase 2**. Both modes remain in the source tree, but the stream path uses the upstream streaming cache.
+
+## Minimum-memory-first research policy
+
+Our primary target is **the smallest correct expert staging footprint**, followed by optimization for throughput at that chosen memory limit. The currently implemented upstream PR allocates a per-layer GPU expert cache. It cannot implement literally 0 GPU expert bytes while executing expert GEMMs on GPU. Moreover, setting `--moe-stream-cache 0` means *automatic sizing*, NOT zero residency. Eight slots per layer with Ling Tiny (`-ub 1`) is the smallest valid staging test for the existing engine, approximately 440 MiB across 23 MoE layers, excluding shared weights and other allocations.
+
+**Future architectural objective (not yet implemented):** replace per-layer device caches with a small shared scratch pool whose capacity scales with concurrently active experts and required execution/transfer overlap, not the total number of layers. Prove graph-lifetime, asynchronous GPU-copy completion and slot-reuse safety before attempting shared scratch; otherwise in-flight kernels can read overwritten weights. On a scratch-only path, RAM remains a separately bounded dynamic expert cache and NVMe is the authoritative backing store.
+
+Never treat a smaller configured budget as proof of a smaller measured total VRAM/RAM footprint. Measure process memory, correct outputs and effective streaming first. Then investigate nonblocking transfers and amortized I/O to optimize throughput. The 512 MiB cache is **not** our default minimal-memory validation target.
 
 ## Windows disk I/O adaptation
 
@@ -36,11 +44,11 @@ When direct I/O is requested, reads align file offsets and read sizes to 4096 by
 
 First preserve all prior binaries and model files. Extract the experimental Windows CUDA artifact to a new folder.
 
-Choose a deterministic short prompt and generate 64–128 tokens. Check the output and exit status using `--moe-stream-cache 512m`, `--moe-stream-ram-cache-mib 0`, `--moe-stream-direct` and `-ub 1`. Read logs to confirm *streamed* layers are detected and that read-from-disk counters increase.
+Choose a deterministic short prompt and generate 64–128 tokens. Start with the smallest GPU expert staging footprint accepted by this implementation: `--moe-stream-cache 8s`, `--moe-stream-ram-cache-mib 0`, `--moe-stream-direct` and `-ub 1`. Read logs to confirm *streamed* layers are detected and that read-from-disk counters increase.
 
 Then run the same prompt at exactly the same settings with `--moe-stream-ram-cache-mib 1024`. Confirm RAM cache hits rise on repeated expert usage, the resident payload size never exceeds the configured cap, SSD read bytes fall or stay equal, and output remains identical.
 
-Then increase `-ub` to 8 to validate original PR prefill-wave behavior, and compare with a normal full-GPU run with identical sampling and token count.
+Only after `-ub 1` correctness succeeds, try `-ub 8` separately with **at least 24 slots/layer** for Ling Tiny (`--moe-stream-cache 24s`), as the original PR's wave-prefill algorithm requires staging capacity for current/next wave and parking slots. Do not confuse this larger temporary capacity with the desired minimal steady-state VRAM. Compare outputs to a normal full-GPU run with identical sampling and token count.
 
 Record separately: decode tokens/s, prefill tokens/s, peak process resident/private RAM, peak process VRAM, RAM cache hits/misses/evictions/bytes, total GGUF read bytes, streamed GPU cache misses, and exception/error logs. Do not conflate page cache or total RAM with the explicit RAM expert LRU payload.
 
@@ -53,7 +61,7 @@ Record separately: decode tokens/s, prefill tokens/s, peak process resident/priv
 - The read count represents application-level GGUF bytes requested. Physical disk I/O may differ due to filesystem alignment or controller caching.
 - The I/O workers are asynchronous with respect to the remap queue, but the target remap still waits for required experts. **No speculative expert prediction is implemented.**
 - Validate model outputs before performance measurements. No streaming throughput guarantee is implied by standalone Phase 4 hardware benchmarks.
-- A 512 MiB GPU cache setting may yield an actual size slightly below the nominal budget because slots are resolved discretely for every layer.
+- The `8s` setting uses eight slots **per streamed layer**, not a shared pool. The actual memory allocated depends on each expert's tensor layout, and the stream path still needs non-expert CUDA/KV/compute memory.
 
 ## What to report
 
