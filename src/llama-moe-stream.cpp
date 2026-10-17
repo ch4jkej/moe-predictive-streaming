@@ -220,6 +220,12 @@ llama_moe_stream::~llama_moe_stream() {
     for (auto & w : workers) {
         w.join();
     }
+    // Many llama-cli/server execution paths do not invoke llama_perf_context_print().
+    // Print the final expert-cache counters at model teardown after I/O workers have
+    // stopped, so a normal run always exposes the data needed for validation.
+    if (stats.n_calls > 0 || stats.n_wave_calls > 0) {
+        print_stats();
+    }
 #ifdef _WIN32
     for (void * h : windows_file_handles) {
         if (h != nullptr && (HANDLE) h != INVALID_HANDLE_VALUE) {
@@ -605,10 +611,14 @@ void llama_moe_stream::print_stats() const {
             __func__, stats.t_stall_us/1000.0, stats.n_calls > 0 ? stats.t_stall_us/1000.0/stats.n_calls : 0.0);
     {
         std::lock_guard<std::mutex> ram_lock(ram_cache_mtx);
-        LLAMA_LOG_INFO("%s: expert RAM cache: configured=%zu MiB, resident=%.2f MiB, hits=%llu, misses=%llu, evictions=%llu, GGUF read=%.2f MiB\\n",
+        LLAMA_LOG_INFO("%s: expert RAM cache: configured=%zu MiB, resident=%.2f MiB, hits=%llu, misses=%llu, evictions=%llu, GGUF read=%.2f MiB\n",
             __func__, ram_cache_budget/(1024*1024), ram_cache_used/1048576.0,
             (unsigned long long) ram_hits, (unsigned long long) ram_misses,
             (unsigned long long) ram_evictions, disk_read_bytes/1048576.0);
+        LLAMA_LOG_INFO("%s: MOE_STREAM_CACHE_COUNTERS budget_bytes=%zu resident_bytes=%zu hits=%llu misses=%llu evictions=%llu gguf_payload_read_bytes=%llu\n",
+            __func__, ram_cache_budget, ram_cache_used,
+            (unsigned long long) ram_hits, (unsigned long long) ram_misses,
+            (unsigned long long) ram_evictions, (unsigned long long) disk_read_bytes);
     }
     if (stats.n_wave_calls > 0) {
         LLAMA_LOG_INFO("%s: moe stream: waves = %" PRId64 " (%" PRId64 " non-empty), preloads issued = %" PRId64 " (ready on arrival = %" PRId64 "), wave stall = %.2f ms\n",
