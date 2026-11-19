@@ -1,0 +1,36 @@
+name: Compilar Voxl para Windows
+on:
+  push:
+    paths:
+      - '.github/workflows/voxl-windows.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    env:
+      VCPKGRS_TRIPLET: x64-windows-static-md
+      LIBCLANG_PATH: C:\Program Files\LLVM\bin
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: tembo/voxl
+          ref: db624341183b01dbc4ec11f3ffa19ba0fd616882
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.93.0
+      - name: Instalar dependencias
+        shell: pwsh
+        run: |
+          vcpkg install x264 libyuv opus --triplet $env:VCPKGRS_TRIPLET
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_ENV
+          npm install -g esbuild
+      - run: cargo build --release --locked
+      - run: .\target\release\voxl.exe --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: voxl-windows-x64
+          path: target/release/voxl.exe
+          retention-days: 3
+          if-no-files-found: error
