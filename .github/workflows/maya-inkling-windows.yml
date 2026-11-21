@@ -15,7 +15,6 @@ jobs:
     timeout-minutes: 35
     env:
       CUDA_VERSION: '13.2.0'
-      CUDA_ROOT: '${{ runner.temp }}\cuda-13.2'
 
     steps:
       - name: Descargar el código de Maya Inkling Mini
@@ -30,6 +29,8 @@ jobs:
         run: |
           $base = 'https://developer.download.nvidia.com/compute/cuda/redist'
           $manifest = Invoke-RestMethod "$base/redistrib_$env:CUDA_VERSION.json"
+          $env:CUDA_ROOT = Join-Path $env:RUNNER_TEMP 'cuda-13.2'
+          "CUDA_ROOT=$env:CUDA_ROOT" >> $env:GITHUB_ENV
           New-Item -ItemType Directory -Path $env:CUDA_ROOT | Out-Null
 
           $components = 'cuda_nvcc', 'cuda_crt', 'cuda_cudart', 'cuda_cccl', 'libnvvm', 'libcublas'
