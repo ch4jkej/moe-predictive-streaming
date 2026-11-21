@@ -3,7 +3,9 @@ name: Compilar Maya Inkling Mini para Windows
 on:
   push:
     branches: [master]
-    paths: ['.github/workflows/maya-inkling-windows.yml']
+    paths:
+      - '.github/workflows/maya-inkling-windows.yml'
+      - 'patches/ik2-expert-row-width.patch'
   workflow_dispatch:
 
 permissions:
@@ -13,16 +15,30 @@ jobs:
   windows:
     runs-on: windows-2022
     timeout-minutes: 35
+    defaults:
+      run:
+        working-directory: maya
     env:
       CUDA_VERSION: '13.2.0'
 
     steps:
+      - name: Descargar la configuración de compilación
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          path: build-config
+          persist-credentials: false
+
       - name: Descargar el código de Maya Inkling Mini
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           repository: alesha-pro/maya-inkling-mini
           ref: c520fd14de3b21d67ddc6b7e7348b761aad26d52
+          path: maya
           persist-credentials: false
+
+      - name: Aplicar la corrección para expertos Q5_K
+        shell: pwsh
+        run: git apply ../build-config/patches/ik2-expert-row-width.patch
 
       - name: Preparar CUDA y cuBLAS
         shell: pwsh
@@ -79,5 +95,5 @@ jobs:
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: maya-ik2-windows-x64-sm86
-          path: dist/
+          path: maya/dist/
           if-no-files-found: error
