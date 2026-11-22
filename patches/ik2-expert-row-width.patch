@@ -1,27 +1,48 @@
 diff --git a/src/ik2/ik2_kernels.cu b/src/ik2/ik2_kernels.cu
-index 942ac7a..0bf8f8d 100644
+index 942ac7a..1d12c57 100644
 --- a/src/ik2/ik2_kernels.cu
 +++ b/src/ik2/ik2_kernels.cu
-@@ -11,6 +11,14 @@
+@@ -7,10 +7,30 @@
+ 
+ #include <algorithm>
+ #include <cmath>
++#include <cstdint>
+ #include <cstdio>
  #include <cstdlib>
  #include <cstring>
  
-+// Reuse the vendored GGML codebooks in both passes of the CUDA compilation.
-+#if defined(__CUDA_ARCH__)
++// Keep both GGML codebook declarations visible to nvcc's host stub generator.
++namespace ik2_ggml_device {
 +#define GGML_COMMON_IMPL_CUDA
-+#else
-+#define GGML_COMMON_IMPL_CPP
-+#endif
 +#include "../../third_party/ggml/ggml-common.h"
++#undef GGML_COMMON_IMPL_CUDA
++#undef GGML_COMMON_IMPL
++#undef GGML_TABLE_BEGIN
++#undef GGML_TABLE_END
++}
++
++namespace ik2_ggml_host {
++#define GGML_COMMON_IMPL_CPP
++#include "../../third_party/ggml/ggml-common.h"
++#undef GGML_COMMON_IMPL_CPP
++#undef GGML_COMMON_IMPL
++#undef GGML_TABLE_BEGIN
++#undef GGML_TABLE_END
++}
 +
  namespace ik2::k {
  namespace {
  
-@@ -2004,6 +2012,39 @@ __host__ __device__ __forceinline__ uint32_t iq_signs8(uint32_t s7) {
+@@ -2004,6 +2024,44 @@ __host__ __device__ __forceinline__ uint32_t iq_signs8(uint32_t s7) {
  #endif
  }
  
 +__host__ __device__ inline float decode_iq2(int type, const uint8_t* blocks, size_t v) {
++#ifdef __CUDA_ARCH__
++    namespace codebooks = ik2_ggml_device;
++#else
++    namespace codebooks = ik2_ggml_host;
++#endif
 +    const int i = (int) (v % 256), ib = i / 32, group = (i % 32) / 8, j = i % 8;
 +    const int block_bytes = type == kIQ2_XXS ? 66 : type == kIQ2_XS ? 74 : 82;
 +    const uint8_t* b = blocks + (v / 256) * block_bytes;
@@ -33,19 +54,19 @@ index 942ac7a..0bf8f8d 100644
 +        const uint8_t* q = b + 2 + 8 * ib;
 +        const uint32_t aux = (uint32_t) q[4] | ((uint32_t) q[5] << 8) |
 +                             ((uint32_t) q[6] << 16) | ((uint32_t) q[7] << 24);
-+        grid = iq2xxs_grid[q[group]];
++        grid = codebooks::iq2xxs_grid[q[group]];
 +        signs = iq_signs8((aux >> (7 * group)) & 127u);
 +        scale = aux >> 28;
 +    } else if (type == kIQ2_XS) {
 +        const uint8_t* q = b + 2 + 8 * ib + 2 * group;
 +        const uint32_t code = q[0] | ((uint32_t) q[1] << 8);
-+        grid = iq2xs_grid[code & 511u];
++        grid = codebooks::iq2xs_grid[code & 511u];
 +        signs = iq_signs8(code >> 9);
 +        scale = (b[66 + ib] >> (4 * (group / 2))) & 15;
 +    } else {
 +        const int index = 4 * ib + group;
 +        const int code = b[2 + index] | ((b[66 + ib] << (8 - 2 * group)) & 0x300);
-+        grid = iq2s_grid[code];
++        grid = codebooks::iq2s_grid[code];
 +        signs = b[34 + index];
 +        scale = (b[74 + ib] >> (4 * (group / 2))) & 15;
 +    }
@@ -57,7 +78,7 @@ index 942ac7a..0bf8f8d 100644
  __host__ __device__ inline float decode_value(int type, const uint8_t* blocks, size_t v) {
      if (type == kNVFP4) {
          const int8_t kv[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
-@@ -2041,6 +2082,16 @@ __host__ __device__ inline float decode_value(int type, const uint8_t* blocks, s
+@@ -2041,6 +2099,16 @@ __host__ __device__ inline float decode_value(int type, const uint8_t* blocks, s
          const float w = (float) ((g >> (8 * (j & 3))) & 0xFFu);
          return db * w * ((signs >> j) & 1u ? -1.0f : 1.0f);
      }
@@ -74,7 +95,7 @@ index 942ac7a..0bf8f8d 100644
      if (type == kIQ4_XS) {   // d, scales_h, scales_l [4], qs [128]
          const uint8_t* b = blocks + (v / 256) * 136;
          const int i = (int) (v % 256), ib = i / 32, j = i % 32;
-@@ -2050,8 +2101,9 @@ __host__ __device__ inline float decode_value(int type, const uint8_t* blocks, s
+@@ -2050,8 +2118,9 @@ __host__ __device__ inline float decode_value(int type, const uint8_t* blocks, s
          const uint8_t q = b[8 + 16 * ib + (j & 15)];
          return d * (float) (ls - 32) * (float) iq4nl_at(j < 16 ? (q & 0xF) : (q >> 4));
      }
@@ -86,7 +107,7 @@ index 942ac7a..0bf8f8d 100644
          const int i = (int) (v % 256), j64 = i / 64, half = (i % 64) / 32, l = i % 32;
          const float d = half_bits_to_float((uint16_t) (b[0] | (b[1] << 8)));
          const float mn = half_bits_to_float((uint16_t) (b[2] | (b[3] << 8)));
-@@ -2063,8 +2115,8 @@ __host__ __device__ inline float decode_value(int type, const uint8_t* blocks, s
+@@ -2063,8 +2132,8 @@ __host__ __device__ inline float decode_value(int type, const uint8_t* blocks, s
          } else {
              sc = (q[is + 4] & 0xF) | ((q[is - 4] >> 6) << 4), m = (q[is + 4] >> 4) | ((q[is] >> 6) << 4);
          }
@@ -97,7 +118,7 @@ index 942ac7a..0bf8f8d 100644
          const int val = (half ? (lo >> 4) : (lo & 0xF)) + (hb ? 16 : 0);
          return d * (float) sc * (float) val - mn * (float) m;
      }
-@@ -5570,12 +5622,36 @@ void argmax_gemv_f16(const uint16_t* W, int ld, const float* x, const float* bas
+@@ -5570,12 +5639,36 @@ void argmax_gemv_f16(const uint16_t* W, int ld, const float* x, const float* bas
  }
  
  int block_values(int type) {
