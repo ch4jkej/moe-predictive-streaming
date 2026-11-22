@@ -1,8 +1,8 @@
 diff --git a/src/ik2/ik2_main.cu b/src/ik2/ik2_main.cu
-index eab1835..68380e6 100644
+index 86f0df1..da881b1 100644
 --- a/src/ik2/ik2_main.cu
 +++ b/src/ik2/ik2_main.cu
-@@ -4496,7 +4496,8 @@ int main(int argc, char** argv) {
+@@ -4632,7 +4632,8 @@ int main(int argc, char** argv) {
              const int nr = (int) pr.second.size();
              if (ti->elements() != (uint64_t) c.E * c.F * C * nr) die(n + ": shape");
              if (!k::block_values((int) ti->type)) die(n + ": type " + ti->type_name() + " not decoded here");

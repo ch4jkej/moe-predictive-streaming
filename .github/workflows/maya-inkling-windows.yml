@@ -1,8 +1,8 @@
-name: Compilar Maya Inkling Mini para Windows
+name: Compilar Maya Inkling Mini e819852 para Windows
 
 on:
   push:
-    branches: [master]
+    branches: [codex/maya-cache-vram]
     paths:
       - '.github/workflows/maya-inkling-windows.yml'
       - 'patches/ik2-expert-row-width.patch'
@@ -32,7 +32,7 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           repository: alesha-pro/maya-inkling-mini
-          ref: c520fd14de3b21d67ddc6b7e7348b761aad26d52
+          ref: e819852f822479af783638a467bfdfe2ed6882ec
           path: maya
           persist-credentials: false
 
@@ -75,25 +75,16 @@ jobs:
           cmake --build build --parallel 2 --target maya-ik2 || exit /b 1
           dumpbin /DEPENDENTS build\maya-ik2.exe || exit /b 1
 
-      - name: Empaquetar el ejecutable y cuBLAS
+      - name: Empaquetar el ejecutable
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path dist | Out-Null
           Copy-Item -LiteralPath 'build\maya-ik2.exe', 'LICENSE' -Destination dist
-          $libraries = 'cublas64_13.dll', 'cublasLt64_13.dll'
-          foreach ($library in $libraries) {
-              $files = @(Get-ChildItem -LiteralPath $env:CUDA_ROOT -Filter $library -File -Recurse)
-              if ($files.Count -ne 1) { throw "No se encontró una copia de $library" }
-              Copy-Item -LiteralPath $files[0].FullName -Destination dist
-          }
-          $notice = Get-ChildItem -LiteralPath $env:CUDA_ROOT -Filter 'LICENSE*' -File | Select-Object -First 1
-          if (-not $notice) { throw 'No se encontró la licencia de NVIDIA' }
-          Copy-Item -LiteralPath $notice.FullName -Destination 'dist\LICENSE-NVIDIA.txt'
           Get-FileHash -LiteralPath 'dist\maya-ik2.exe'
 
       - name: Guardar el artefacto
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
-          name: maya-ik2-windows-x64-sm86
+          name: maya-ik2-e819852-windows-x64-sm86
           path: maya/dist/
           if-no-files-found: error
