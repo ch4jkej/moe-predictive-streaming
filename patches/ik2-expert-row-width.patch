@@ -1,8 +1,8 @@
 diff --git a/src/ik2/ik2_kernels.cu b/src/ik2/ik2_kernels.cu
-index 942ac7a..1d12c57 100644
+index 942ac7a..20e108b 100644
 --- a/src/ik2/ik2_kernels.cu
 +++ b/src/ik2/ik2_kernels.cu
-@@ -7,10 +7,30 @@
+@@ -7,9 +7,30 @@
  
  #include <algorithm>
  #include <cmath>
@@ -10,7 +10,8 @@ index 942ac7a..1d12c57 100644
  #include <cstdio>
  #include <cstdlib>
  #include <cstring>
- 
++#include <type_traits>
++
 +// Keep both GGML codebook declarations visible to nvcc's host stub generator.
 +namespace ik2_ggml_device {
 +#define GGML_COMMON_IMPL_CUDA
@@ -29,11 +30,10 @@ index 942ac7a..1d12c57 100644
 +#undef GGML_TABLE_BEGIN
 +#undef GGML_TABLE_END
 +}
-+
+ 
  namespace ik2::k {
  namespace {
- 
-@@ -2004,6 +2024,44 @@ __host__ __device__ __forceinline__ uint32_t iq_signs8(uint32_t s7) {
+@@ -2004,6 +2025,44 @@ __host__ __device__ __forceinline__ uint32_t iq_signs8(uint32_t s7) {
  #endif
  }
  
@@ -78,7 +78,7 @@ index 942ac7a..1d12c57 100644
  __host__ __device__ inline float decode_value(int type, const uint8_t* blocks, size_t v) {
      if (type == kNVFP4) {
          const int8_t kv[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
-@@ -2041,6 +2099,16 @@ __host__ __device__ inline float decode_value(int type, const uint8_t* blocks, s
+@@ -2041,6 +2100,16 @@ __host__ __device__ inline float decode_value(int type, const uint8_t* blocks, s
          const float w = (float) ((g >> (8 * (j & 3))) & 0xFFu);
          return db * w * ((signs >> j) & 1u ? -1.0f : 1.0f);
      }
@@ -95,7 +95,7 @@ index 942ac7a..1d12c57 100644
      if (type == kIQ4_XS) {   // d, scales_h, scales_l [4], qs [128]
          const uint8_t* b = blocks + (v / 256) * 136;
          const int i = (int) (v % 256), ib = i / 32, j = i % 32;
-@@ -2050,8 +2118,9 @@ __host__ __device__ inline float decode_value(int type, const uint8_t* blocks, s
+@@ -2050,8 +2119,9 @@ __host__ __device__ inline float decode_value(int type, const uint8_t* blocks, s
          const uint8_t q = b[8 + 16 * ib + (j & 15)];
          return d * (float) (ls - 32) * (float) iq4nl_at(j < 16 ? (q & 0xF) : (q >> 4));
      }
@@ -107,7 +107,7 @@ index 942ac7a..1d12c57 100644
          const int i = (int) (v % 256), j64 = i / 64, half = (i % 64) / 32, l = i % 32;
          const float d = half_bits_to_float((uint16_t) (b[0] | (b[1] << 8)));
          const float mn = half_bits_to_float((uint16_t) (b[2] | (b[3] << 8)));
-@@ -2063,8 +2132,8 @@ __host__ __device__ inline float decode_value(int type, const uint8_t* blocks, s
+@@ -2063,8 +2133,8 @@ __host__ __device__ inline float decode_value(int type, const uint8_t* blocks, s
          } else {
              sc = (q[is + 4] & 0xF) | ((q[is - 4] >> 6) << 4), m = (q[is + 4] >> 4) | ((q[is] >> 6) << 4);
          }
@@ -118,7 +118,153 @@ index 942ac7a..1d12c57 100644
          const int val = (half ? (lo >> 4) : (lo & 0xF)) + (hb ? 16 : 0);
          return d * (float) sc * (float) val - mn * (float) m;
      }
-@@ -5570,12 +5639,36 @@ void argmax_gemv_f16(const uint16_t* W, int ld, const float* x, const float* bas
+@@ -2210,6 +2280,89 @@ __device__ __forceinline__ void load_xv8(const float* x, float4 (&xv)[8]) {
+     for (int k = 0; k < 8; ++k) xv[k] = *(const float4*) (x + 4 * k);
+ }
+ 
++// Each lane consumes one eight-weight code at a time and applies its scale after the dot.
++template <int Q>
++__device__ __forceinline__ float iq_group_dot(const uint8_t* b, int group, float4 x0, float4 x1) {
++    const auto* b16 = reinterpret_cast<const uint16_t*>(b);
++    const float d = h2f(__ldg(b16));
++    if constexpr (Q == kIQ4_NL) {
++        const auto* q = b16 + 1 + 2 * group;
++        const uint32_t packed = __ldg(q) | ((uint32_t) __ldg(q + 1) << 16);
++        return d * (dot_u32_f4(iq4nl_lut4(packed, false), x0) + dot_u32_f4(iq4nl_lut4(packed, true), x1));
++    } else {
++        const int sub = group >> 2, lane_in_sub = group & 3;
++        uint32_t grid0, grid1, signs;
++        int scale;
++        if constexpr (Q == kIQ3_XXS) {
++            const auto* s = b16 + 33 + 2 * sub;
++            const uint32_t aux = __ldg(s) | ((uint32_t) __ldg(s + 1) << 16);
++            const uint32_t code = __ldg(b16 + 1 + group);
++            grid0 = __ldg(d_iq3xxs_grid + (code & 255u));
++            grid1 = __ldg(d_iq3xxs_grid + (code >> 8));
++            signs = iq_signs8((aux >> (7 * lane_in_sub)) & 127u);
++            scale = aux >> 28;
++        } else {
++            uint64_t grid;
++            if constexpr (Q == kIQ2_XXS) {
++                const auto* q = b16 + 1 + 4 * sub;
++                const uint32_t aux = __ldg(q + 2) | ((uint32_t) __ldg(q + 3) << 16);
++                grid = __ldg(ik2_ggml_device::iq2xxs_grid + __ldg(b + 2 + 8 * sub + lane_in_sub));
++                signs = iq_signs8((aux >> (7 * lane_in_sub)) & 127u);
++                scale = aux >> 28;
++            } else if constexpr (Q == kIQ2_XS) {
++                const uint32_t code = __ldg(b16 + 1 + group);
++                grid = __ldg(ik2_ggml_device::iq2xs_grid + (code & 511u));
++                signs = iq_signs8(code >> 9);
++                scale = (__ldg(b + 66 + sub) >> (4 * (lane_in_sub >> 1))) & 15;
++            } else {
++                static_assert(Q == kIQ2_S);
++                const int code = __ldg(b + 2 + group) | ((__ldg(b + 66 + sub) << (8 - 2 * lane_in_sub)) & 0x300);
++                grid = __ldg(ik2_ggml_device::iq2s_grid + code);
++                signs = __ldg(b + 34 + group);
++                scale = (__ldg(b + 74 + sub) >> (4 * (lane_in_sub >> 1))) & 15;
++            }
++            grid0 = (uint32_t) grid;
++            grid1 = (uint32_t) (grid >> 32);
++        }
++        constexpr float scale_step = Q == kIQ3_XXS ? 0.5f : 0.25f;
++        return d * ((0.5f + (float) scale) * scale_step) *
++               (sdot4_u8(grid0, signs, x0) + sdot4_u8(grid1, signs >> 4, x1));
++    }
++}
++
++template <int Q, bool Pair>
++__device__ __forceinline__ void iq_row_dot(const uint8_t* w0, const uint8_t* w1, const float* xs, int K,
++                                          float& y0, float& y1) {
++    constexpr int groups_per_block = Q == kIQ4_NL ? 4 : 32;
++    constexpr int bytes = Q == kIQ4_NL ? 18 : Q == kIQ2_XXS ? 66 : Q == kIQ2_XS ? 74 : Q == kIQ2_S ? 82 : 98;
++    const int lane = threadIdx.x & 31;
++    float a0 = 0.0f, a1 = 0.0f;
++    if (((reinterpret_cast<uintptr_t>(w0) | reinterpret_cast<uintptr_t>(w1)) & 1) == 0) {
++        for (int g = lane; g < K / 8; g += 32) {
++            const size_t offset = (size_t) (g / groups_per_block) * bytes;
++            const int sub = g % groups_per_block;
++            const float* x = xs + (g >> 2) * 36 + (g & 3) * (Q == kIQ4_NL ? 4 : 8);
++            const float4 x0 = *reinterpret_cast<const float4*>(x);
++            const float4 x1 = *reinterpret_cast<const float4*>(x + (Q == kIQ4_NL ? 16 : 4));
++            a0 += iq_group_dot<Q>(w0 + offset, sub, x0, x1);
++            if constexpr (Pair) a1 += iq_group_dot<Q>(w1 + offset, sub, x0, x1);
++        }
++    } else {
++        for (int i = lane; i < K; i += 32) {
++            const float x = xs[xp(i)];
++            a0 += decode_value(Q, w0, i) * x;
++            if constexpr (Pair) a1 += decode_value(Q, w1, i) * x;
++        }
++    }
++#pragma unroll
++    for (int o = 16; o > 0; o >>= 1) {
++        a0 += __shfl_xor_sync(0xffffffffu, a0, o);
++        if constexpr (Pair) a1 += __shfl_xor_sync(0xffffffffu, a1, o);
++    }
++    y0 = a0;
++    if constexpr (Pair) y1 = a1;
++}
++
+ // a warp's dot of one row of K values (blocks of `type` from w) with xs (shared, padded: xp), every lane gets it
+ __device__ float row_dot(int type, const uint8_t* w, const float* xs, int K) {
+     const int lane = threadIdx.x & 31;
+@@ -2874,7 +3027,7 @@ __global__ void experts_gate_up_kernel(const uint8_t* const* blob, const int* to
+     }
+ }
+ 
+-template <int WARPS, int ROWS>
++template <int WARPS, int ROWS, int Q = 0>
+ __global__ void experts_gate_up_swiglu_kernel(const uint8_t* const* blob, const int* tok, int ty_gate, int ty_up,
+                                               size_t eb0, const float* x, int C, int F, size_t rb_gate, size_t rb_up,
+                                               const float* sg, const float* su, float gcap, float ucap, uint16_t* h,
+@@ -2891,7 +3044,9 @@ __global__ void experts_gate_up_swiglu_kernel(const uint8_t* const* blob, const
+         const int r = (blockIdx.x * WARPS + warp) * ROWS + j;
+         if (r >= F) break;
+         float vg, vu;
+-        if (ty_gate == ty_up) {
++        if constexpr (Q != 0) {
++            iq_row_dot<Q, true>(bl + (size_t) r * rb_gate, bl + eb0 + (size_t) r * rb_up, xs, C, vg, vu);
++        } else if (ty_gate == ty_up) {
+             row_dot_pair(ty_gate, bl + (size_t) r * rb_gate, bl + eb0 + (size_t) r * rb_up, xs, C, vg, vu);
+         } else {
+             vg = row_dot(ty_gate, bl + (size_t) r * rb_gate, xs, C);
+@@ -2905,7 +3060,7 @@ __global__ void experts_gate_up_swiglu_kernel(const uint8_t* const* blob, const
+     }
+ }
+ 
+-template <int WARPS, int ROWS>
++template <int WARPS, int ROWS, int Q = 0>
+ __global__ void experts_down_kernel(const uint8_t* const* blob, int ty_down, size_t off_down, const uint16_t* h,
+                                     int C, int F, size_t rb_down, float* y) {
+     extern __shared__ float xs[];
+@@ -2919,14 +3074,24 @@ __global__ void experts_down_kernel(const uint8_t* const* blob, int ty_down, siz
+         if (row >= C) break;
+         if (j + 1 < ROWS && row + 1 < C) {
+             float v0, v1;
+-            row_dot_2(ty_down, w + (size_t) row * rb_down, w + (size_t) (row + 1) * rb_down, xs, F, v0, v1);
++            if constexpr (Q != 0) {
++                iq_row_dot<Q, true>(w + (size_t) row * rb_down, w + (size_t) (row + 1) * rb_down, xs, F, v0, v1);
++            } else {
++                row_dot_2(ty_down, w + (size_t) row * rb_down, w + (size_t) (row + 1) * rb_down, xs, F, v0, v1);
++            }
+             if ((threadIdx.x & 31) == 0) {
+                 y[(size_t) s * C + row] = v0;
+                 y[(size_t) s * C + row + 1] = v1;
+             }
+             j += 2;
+         } else {
+-            const float v = row_dot(ty_down, w + (size_t) row * rb_down, xs, F);
++            float v;
++            if constexpr (Q != 0) {
++                float unused;
++                iq_row_dot<Q, false>(w + (size_t) row * rb_down, nullptr, xs, F, v, unused);
++            } else {
++                v = row_dot(ty_down, w + (size_t) row * rb_down, xs, F);
++            }
+             if ((threadIdx.x & 31) == 0) y[(size_t) s * C + row] = v;
+             j += 1;
+         }
+@@ -5570,12 +5735,36 @@ void argmax_gemv_f16(const uint16_t* W, int ld, const float* x, const float* bas
  }
  
  int block_values(int type) {
@@ -159,6 +305,45 @@ index 942ac7a..1d12c57 100644
  }
  
  template <int WARPS, int ROWS>
+@@ -5589,8 +5778,14 @@ template <int WARPS, int ROWS>
+ void launch_experts_down(const uint8_t* const* blob, int S, int ty_down, size_t off_down, const uint16_t* h, int C,
+                          int F, float* y, cudaStream_t s) {
+     const dim3 g((unsigned) ((C + WARPS * ROWS - 1) / (WARPS * ROWS)), (unsigned) S);
+-    experts_down_kernel<WARPS, ROWS><<<g, WARPS * 32, xp_floats(F) * 4, s>>>(
+-        blob, ty_down, off_down, h, C, F, mv_row_bytes(ty_down, F), y);
++    const size_t rb = mv_row_bytes(ty_down, F);
++    if (ty_down == kIQ4_NL) {
++        experts_down_kernel<WARPS, ROWS, kIQ4_NL><<<g, WARPS * 32, xp_floats(F) * 4, s>>>(
++            blob, ty_down, off_down, h, C, F, rb, y);
++    } else {
++        experts_down_kernel<WARPS, ROWS><<<g, WARPS * 32, xp_floats(F) * 4, s>>>(
++            blob, ty_down, off_down, h, C, F, rb, y);
++    }
+ }
+ 
+ void expert_limb_mv(bool gate, const uint8_t* const* blob, size_t offset, int C, int F, int S, const float* x,
+@@ -5708,9 +5903,18 @@ void launch_experts_gate_up_swiglu(const uint8_t* const* blob, const int* tok, i
+                                    float gcap, float ucap, uint16_t* h, cudaStream_t s, const int* orow = nullptr,
+                                    int h_ld = 0) {
+     const dim3 g((unsigned) ((F + WARPS * ROWS - 1) / (WARPS * ROWS)), (unsigned) S);
+-    experts_gate_up_swiglu_kernel<WARPS, ROWS><<<g, WARPS * 32, xp_floats(C) * 4, s>>>(
+-        blob, tok, ty_gate, ty_up, eb0, x, C, F, mv_row_bytes(ty_gate, C), mv_row_bytes(ty_up, C), sg, su, gcap,
+-        ucap, h, orow, h_ld > 0 ? h_ld : F);
++    const size_t rb_gate = mv_row_bytes(ty_gate, C), rb_up = mv_row_bytes(ty_up, C);
++    const auto launch = [&](auto quant) {
++        experts_gate_up_swiglu_kernel<WARPS, ROWS, decltype(quant)::value><<<g, WARPS * 32, xp_floats(C) * 4, s>>>(
++            blob, tok, ty_gate, ty_up, eb0, x, C, F, rb_gate, rb_up, sg, su, gcap, ucap, h, orow, h_ld > 0 ? h_ld : F);
++    };
++    switch (ty_gate == ty_up ? ty_gate : 0) {
++    case kIQ2_XXS: launch(std::integral_constant<int, kIQ2_XXS>{}); break;
++    case kIQ2_XS: launch(std::integral_constant<int, kIQ2_XS>{}); break;
++    case kIQ2_S: launch(std::integral_constant<int, kIQ2_S>{}); break;
++    case kIQ3_XXS: launch(std::integral_constant<int, kIQ3_XXS>{}); break;
++    default: launch(std::integral_constant<int, 0>{}); break;
++    }
+ }
+ 
+ void experts_gate_up_swiglu_rows(const uint8_t* const* blob, const int* tok, int S, int ty_gate, int ty_up,
 diff --git a/src/ik2/ik2_kernels.cuh b/src/ik2/ik2_kernels.cuh
 index 9f756ce..59f5e6b 100644
 --- a/src/ik2/ik2_kernels.cuh
@@ -187,3 +372,45 @@ index 86f0df1..da881b1 100644
                  die(n + ": a row is not whole " + ti->type_name() + " blocks");
              const size_t per = tensor_bytes(*ti) / c.E;
              std::vector<float> sc;
+diff --git a/tests/ik2_kernels_test.cu b/tests/ik2_kernels_test.cu
+index 2aba01d..42809c6 100644
+--- a/tests/ik2_kernels_test.cu
++++ b/tests/ik2_kernels_test.cu
+@@ -609,7 +609,8 @@ std::vector<uint8_t> rand_blocks(int type, size_t n_values) {
+         if (type == k::kQ8_0) fix(0);
+         if (type == k::kQ5_K) fix(0), fix(2);
+         if (type == k::kQ6_K) fix(208);
+-        if (type == k::kIQ3_XXS || type == k::kIQ4_XS) fix(0);
++        if (type == k::kIQ2_XXS || type == k::kIQ2_XS || type == k::kIQ2_S ||
++            type == k::kIQ3_XXS || type == k::kIQ4_NL || type == k::kIQ4_XS) fix(0);
+     }
+     return raw;
+ }
+@@ -686,6 +687,7 @@ void test_experts_mv() {
+                           {k::kQ5_K, k::kQ5_K, k::kQ6_K, "Q5_K / Q6_K"},
+                           {k::kQ8_0, k::kNVFP4, k::kQ6_K, "mixed"},
+                           {k::kIQ3_XXS, k::kIQ3_XXS, k::kNVFP4, "IQ3_XXS / NVFP4"},
++                          {k::kIQ2_S, k::kIQ2_S, k::kIQ4_NL, "IQ2_S / IQ4_NL"},
+                           {k::kIQ4_XS, k::kIQ4_XS, k::kQ6_K, "IQ4_XS / Q6_K"}};
+     for (const Case& cs : cases) {
+         const int E = 3;
+@@ -1712,7 +1714,7 @@ void test_round2_fused() {
+ 
+     // 4. experts_gate_up_swiglu vs experts_gate_up + swiglu_cap_f32
+     {
+-        const int C = 512, F = 256, E = 3;
++        const int C = 768, F = 256, E = 3;
+         struct Case {
+             int tg, tu, off;
+             bool with_scale;
+@@ -1725,6 +1727,10 @@ void test_round2_fused() {
+             {k::kQ8_0, k::kQ8_0, 0, true, "Q8_0 aligned"},
+             {k::kQ8_0, k::kQ8_0, 2, true, "Q8_0 unaligned"},
+             {k::kQ8_0, k::kNVFP4, 0, true, "Q8_0/NVFP4 mixed"},
++            {k::kIQ2_XXS, k::kIQ2_XXS, 0, true, "IQ2_XXS scaled"},
++            {k::kIQ2_XS, k::kIQ2_XS, 2, true, "IQ2_XS aligned to two bytes"},
++            {k::kIQ2_S, k::kIQ2_S, 0, false, "IQ2_S unscaled"},
++            {k::kIQ2_S, k::kIQ2_S, 1, false, "IQ2_S unaligned"},
+             {k::kIQ3_XXS, k::kIQ3_XXS, 0, true, "IQ3_XXS scaled"},
+             {k::kIQ4_XS, k::kIQ4_XS, 0, false, "IQ4_XS unscaled"},
+         };

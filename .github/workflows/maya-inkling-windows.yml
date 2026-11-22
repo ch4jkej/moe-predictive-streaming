@@ -1,8 +1,8 @@
-name: Compilar Maya Inkling Mini con IQ3_XXS para Windows
+name: Compilar Maya Inkling Mini con decode IQ3 optimizado para Windows
 
 on:
   push:
-    branches: [codex/maya-iq3-xxs]
+    branches: [codex/maya-iq3-decode]
     paths:
       - '.github/workflows/maya-inkling-windows.yml'
       - 'patches/ik2-expert-row-width.patch'
@@ -71,20 +71,20 @@ jobs:
         shell: cmd
         run: |
           call "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64 || exit /b 1
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_TESTS=OFF -DSTRATA_NATIVE_EXPERTS=OFF -DSTRATA_PORTABLE=ON -DCMAKE_CUDA_ARCHITECTURES=86 "-DCUDAToolkit_ROOT=%CUDA_ROOT%" "-DCMAKE_CUDA_COMPILER=%CUDA_ROOT%\bin\nvcc.exe" || exit /b 1
-          cmake --build build --parallel 2 --target maya-ik2 || exit /b 1
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_TESTS=ON -DSTRATA_NATIVE_EXPERTS=OFF -DSTRATA_PORTABLE=ON -DCMAKE_CUDA_ARCHITECTURES=86 "-DCUDAToolkit_ROOT=%CUDA_ROOT%" "-DCMAKE_CUDA_COMPILER=%CUDA_ROOT%\bin\nvcc.exe" || exit /b 1
+          cmake --build build --parallel 2 --target maya-ik2 ik2_kernels_test || exit /b 1
           dumpbin /DEPENDENTS build\maya-ik2.exe || exit /b 1
 
       - name: Empaquetar el ejecutable
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path dist | Out-Null
-          Copy-Item -LiteralPath 'build\maya-ik2.exe', 'LICENSE' -Destination dist
+          Copy-Item -LiteralPath 'build\maya-ik2.exe', 'build\ik2_kernels_test.exe', 'LICENSE' -Destination dist
           Get-FileHash -LiteralPath 'dist\maya-ik2.exe'
 
       - name: Guardar el artefacto
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
-          name: maya-ik2-iq3-windows-x64-sm86
+          name: maya-ik2-iq3-decode-windows-x64-sm86
           path: maya/dist/
           if-no-files-found: error
