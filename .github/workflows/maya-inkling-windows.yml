@@ -1,8 +1,8 @@
-name: Compilar Maya Inkling Mini e819852 para Windows
+name: Compilar Maya Inkling Mini con IQ3_XXS para Windows
 
 on:
   push:
-    branches: [codex/maya-cache-vram]
+    branches: [codex/maya-iq3-xxs]
     paths:
       - '.github/workflows/maya-inkling-windows.yml'
       - 'patches/ik2-expert-row-width.patch'
@@ -36,7 +36,7 @@ jobs:
           path: maya
           persist-credentials: false
 
-      - name: Aplicar la corrección para expertos Q5_K
+      - name: Aplicar decodificadores GGUF y corrección de expertos
         shell: pwsh
         run: git apply ../build-config/patches/ik2-expert-row-width.patch
 
@@ -85,6 +85,6 @@ jobs:
       - name: Guardar el artefacto
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
-          name: maya-ik2-e819852-windows-x64-sm86
+          name: maya-ik2-iq3-windows-x64-sm86
           path: maya/dist/
           if-no-files-found: error
